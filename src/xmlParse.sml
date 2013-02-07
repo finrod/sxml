@@ -30,16 +30,6 @@ struct
   val ws = match Ranges.ws
   val space = literal (uc #" ")
 
-  local open Stream in
-  fun normalizeWS s =
-      (case front s of
-           Nil => eager Nil
-         | Cons (0wxD, s') => (case front s' of
-                                   Cons (0wxA, _) => s'
-                                 | _ => eager (Cons (0wxA, s')))
-         | Cons (c, s') => lazy (fn () => Cons (c, normalizeWS s')))
-  end
-
   fun sepBy1 f g = g && repeat (f >> g) wth op::
   fun notIn xs = try (char suchthat (fn x => List.all (fn y => x <> y) xs))
   fun oneOf xs = try (char suchthat (fn x => List.exists (fn y => x = y) xs))
@@ -81,8 +71,8 @@ struct
   val pubidChar = ws suchthat (fn x => x <> 0wx9) <|> match Ranges.pubidChar
   val pubidLiteral = quote (fn s => repeat (not (oneOf s) >> pubidChar)) wth Vector.fromList
 
-  val charData = !! (repeat1 (not (us"]]>") >> notIn (u"<&")) wth Vector.fromList)
-                    wth (fn (x, p) => CStr (false, x, p))
+  val charData' = repeat1 (not (us"]]>") >> notIn (u"<&")) wth Vector.fromList
+  val charData = !! (charData') wth (fn (x, p) => CStr (false, x, p))
 
   val comment = us"<!--" >> repeat (not (us"--") >> char) << us"-->"
                   wth Comment o Vector.fromList
@@ -91,8 +81,8 @@ struct
   fun piarg p = (case p of SOME s => Vector.fromList s | NONE => #[])
   val pi = us"<?" >> piTarg && (opt (ws >> repeat (not (us"?>") >> char)) wth piarg) << us"?>" wth PI
 
-  val cdsect = !! (us"<![CDATA[" >> repeat (not (us"]]>") >> char) << us"]]>")
-                  wth (fn (x, p) => CStr (true, Vector.fromList x, p))
+  val cdsect' = us"<![CDATA[" >> repeat (not (us"]]>") >> char) << us"]]>" wth Vector.fromList
+  val cdsect = !! (cdsect') wth (fn (x, p) => CStr (true, x, p))
 
   val misc = (!! (try pi) <|> !! comment) wth CMisc
   val miscWS = repeat (ws wth const NONE <|> (try pi <|> comment) wth SOME) wth somes
@@ -205,6 +195,71 @@ struct
   val extParsedEnt = textDecl && content
   val document = prolog && element && miscWS wth Document o flat3
 
-  fun parseString p s = Sum.outR (simpleParse p (CoordinatedStream.coordinate (const false) (Coord.init "-") (Stream.fromList (u s))))
+  exception UnknownEncoding
+  exception UnsupportedEncoding of string
+  exception EncodingMismatch of string * string
+  datatype enc = U16 | U8 | U8_ISO | U8_NONSPEC
+
+  local
+      open Stream
+      fun matchEnc (U16, s) =
+          if s = "UTF-16" then () else raise EncodingMismatch ("UTF-16", s)
+        | matchEnc (U8, s) =
+          if s = "UTF-8" then () else raise EncodingMismatch ("UTF-8", s)
+        | matchEnc (U8_ISO, s) =
+          if s = "UTF-8" then ()
+          else if substring (s, 0, 9) = "iso-8859-" then raise UnsupportedEncoding s
+          else raise EncodingMismatch ("utf-8 or iso", s)
+        | matchEnc _ = raise UnknownEncoding
+      fun eol s = (case front s of
+                       Cons (0wxA : uchar, _) => true
+                     | _ => false)
+  in
+  fun coord file = CoordinatedStream.coordinate eol (Coord.init file)
+  fun normalizeWS s : uchar Stream.stream =
+      (case front s of
+           Nil => eager Nil
+         | Cons (0wxD, s') => (case front s' of
+                                   Cons (0wxA, _) => s'
+                                 | _ => eager (Cons (0wxA, s')))
+         | Cons (c, s') => lazy (fn () => Cons (c, normalizeWS s')))
+  fun detectEncoding (s : char stream) =
+      let val xs = List.map ord (take (s, 4))
+          val (codec, ds, enc) =
+              (case xs of
+                   (* w/ BOM *)
+                   [0x00, 0x00, 0xFE, 0xFF] => raise UnsupportedEncoding "UCS-4"
+                 | [0xFF, 0xFE, 0x00, 0x00] => raise UnsupportedEncoding "UCS-4"
+                 | [0x00, 0x00, 0xFF, 0xFE] => raise UnsupportedEncoding "UCS-4"
+                 | [0xFE, 0xFF, 0x00, 0x00] => raise UnsupportedEncoding "UCS-4"
+                 | [0xFE, 0xFF, _, _] => (Utf16BE.decodeStr, drop (s, 2), U16)
+                 | [0xFF, 0xFE, _, _] => (Utf16LE.decodeStr, drop (s, 2), U16)
+                 | [0xEF, 0xBB, 0xBF, _] => (Utf8.decodeStr, drop (s, 3), U8)
+                 (* w/o BOM *)
+                 | [0x00, 0x00, 0x00, 0x3C] => raise UnsupportedEncoding "UCS-4"
+                 | [0x3C, 0x00, 0x00, 0x00] => raise UnsupportedEncoding "UCS-4"
+                 | [0x00, 0x3C, 0x00, 0x00] => raise UnsupportedEncoding "UCS-4"
+                 | [0x00, 0x00, 0x3C, 0x00] => raise UnsupportedEncoding "UCS-4"
+                 | [0x00, 0x3C, 0x00, 0x3F] => (Utf16BE.decodeStr, s, U16)
+                 | [0x00, 0x3F, 0x00, 0x3C] => (Utf16LE.decodeStr, s, U16)
+                 | [0x3C, 0x3F, 0x78, 0x6D] => (Utf8.decodeStr, s, U8_ISO)
+                 | [0x4C, 0x6F, 0xA7, 0x94] => raise UnsupportedEncoding "EBCDIC"
+                 | _ => (Utf8.decodeStr, s, U8_NONSPEC))
+          val us = codec ds
+          val tus = coord "-" us
+          val _ = (case simpleParse xmlDecl tus of
+                       Sum.INR (XMLDecl (v, SOME edec, sa)) => matchEnc (enc, edec)
+                     | _ => ())
+      in us
+      end
+  end
+
+  fun parseString p =
+      simpleParse p o coord "-" o normalizeWS o detectEncoding o Stream.fromString
+
+  fun parseStrEnc p enc =
+      simpleParse p o coord "-" o normalizeWS o enc o Stream.fromString
+
+  fun parseStringDef p = parseStrEnc p Utf8.decodeStr
 
 end

@@ -6,3 +6,4 @@ Group is
       src/chars.sml
       src/xmlData.sml
       src/xmlParse.sml
+      src/xmlStream.sml
